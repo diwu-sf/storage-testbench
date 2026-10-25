@@ -26,6 +26,7 @@ from werkzeug.middleware.dispatcher import DispatcherMiddleware
 import gcs as gcs_type
 import testbench
 from google.storage.v2 import storage_pb2
+from testbench import xml_delete
 from testbench.servers import echo, iam_rest_server, projects_rest_server
 
 db = testbench.database.Database.init()
@@ -122,6 +123,25 @@ def root_create_resumable_object(bucket_name, object_name):
 @retry_test(method="storage.objects.insert")
 def root_put_object_with_bucket(bucket_name, object_name):
     return xml_put_object(bucket_name, object_name)
+
+
+@retry_test(method="storage.objects.delete")
+def xml_delete_objects(bucket_name):
+    return xml_delete.delete_objects(db, flask.request, bucket_name)
+
+
+@root.route("/", subdomain="<bucket_name>", methods=["POST"])
+@root.route("/<bucket_name>", subdomain="", methods=["POST"], strict_slashes=False)
+def root_delete_objects(bucket_name):
+    if "delete" not in flask.request.args:
+        flask.abort(404)
+    try:
+        # Retry instructions apply once to the HTTP request, before any deletes.
+        return xml_delete_objects(bucket_name)
+    except xml_delete.XmlError as ex:
+        return ex.as_response()
+    except testbench.error.RestException as ex:
+        return xml_delete.XmlError.from_rest(ex).as_response()
 
 
 @root.route("/retry_tests", methods=["GET"])

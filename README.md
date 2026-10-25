@@ -18,6 +18,7 @@ is expected to be used by Storage library maintainers.
     - [Run the testbench](#run-the-testbench)
     - [Start the gRPC server](#start-the-gRPC-server)
     - [Check that the testbench is running](#check-that-the-testbench-is-running)
+    - [XML multi-object deletion](#xml-multi-object-deletion)
   - [Updating Proto Files](#updating-proto-files)
   - [Force Failures](#force-failures)
     - [return-broken-stream](#return-broken-stream)
@@ -122,6 +123,61 @@ curl -X GET localhost:9000
 The response you get should be: `OK`
 
 Now you can use the testbench (while it's running) with the client libraries.
+
+### XML multi-object deletion
+
+The testbench supports the [GCS XML multi-object delete API](https://cloud.google.com/storage/docs/xml-api/post-bucket)
+through `POST /BUCKET?delete` (also `/BUCKET/?delete`) and the bucket subdomain's
+`POST /?delete` endpoint. Additional query parameters are allowed. Objects uploaded
+through JSON, XML, or Storage v2 gRPC share the same database and can be deleted
+with this operation.
+
+Send a `Delete` document containing 1–1,000 `Object` elements, each with a `Key`
+and optional decimal `VersionId`. Keys are XML text: escape XML special characters,
+but do not URL-encode names. As in GCS, surrounding XML whitespace is trimmed from
+keys. Both unqualified elements and the default namespace
+`http://s3.amazonaws.com/doc/2006-03-01/` are supported. The request needs a Base64
+MD5 of the exact body in `Content-MD5` or `x-goog-hash: md5=...`, or a Base64
+big-endian CRC32 in `x-amz-checksum-crc32`. CRC32C alone does not satisfy this
+operation's checksum requirement. All supplied MD5 and CRC32 checksums are checked.
+
+For example, after creating a bucket and object:
+
+```python
+import base64
+import hashlib
+import requests
+
+body = b"<Delete><Object><Key>example.txt</Key></Object></Delete>"
+response = requests.post(
+    "http://localhost:9000/my-bucket?delete",
+    data=body,
+    headers={"Content-MD5": base64.b64encode(hashlib.md5(body).digest()).decode()},
+)
+response.raise_for_status()
+print(response.text)  # Inspect per-object Error elements even when HTTP is 200.
+```
+
+Missing objects and generations are acknowledged, duplicate targets are collapsed,
+and responses can contain both `Deleted` and `Error` elements. Response order is
+not a contract. `Quiet` suppresses successes only when its text equals `true`
+ignoring case; other values leave the response verbose. Explicit generations are
+returned in both `Generation` and `VersionId`. Explicit generation zero selects
+the live generation for removal, including in versioned buckets. A missing bucket
+or an invalid envelope rejects the whole request before
+deleting any objects. Temporary and event-based holds produce per-object errors.
+
+Deleting without a generation in a versioned bucket makes the live object
+noncurrent. Explicit generation deletion removes that version; soft delete retains
+removed versions when enabled. These transitions use the shared JSON/gRPC backend.
+The testbench still retains overwritten generations in unversioned buckets and
+does not enforce IAM or retention periods. DTDs and entities are deliberately
+rejected. Error messages and schema diagnostics are simplified. Protocol edge
+cases were checked against live GCS on 2026-10-25.
+
+For retry testing, use `storage.objects.delete` with transport `HTTP` and the
+`x-retry-test-id` header. Each instruction applies once to the whole bulk request;
+for example, `return-503` returns an XML `SlowDown` error before any deletions.
 
 ## Updating Proto Files
 

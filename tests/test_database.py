@@ -247,6 +247,98 @@ class TestDatabaseObject(unittest.TestCase):
         self.bucket, _ = gcs.bucket.Bucket.init(request, None)
         self.database.insert_bucket(self.bucket, None)
 
+    def test_delete_versioning_and_soft_delete(self):
+        for versioning in (False, True):
+            for soft_delete in (False, True):
+                for generation_arg in (None, 0, "0", "explicit"):
+                    with self.subTest(
+                        versioning=versioning,
+                        soft_delete=soft_delete,
+                        generation=generation_arg,
+                    ):
+                        self.bucket.metadata.versioning.enabled = versioning
+                        self.bucket.metadata.ClearField("soft_delete_policy")
+                        if soft_delete:
+                            self.bucket.metadata.soft_delete_policy.retention_duration.seconds = (
+                                7 * 86400
+                            )
+                        request = testbench.common.FakeRequest(
+                            args={"name": "object"},
+                            data=b"contents",
+                            headers={},
+                            environ={},
+                        )
+                        blob, _ = gcs.object.Object.init_media(
+                            request, self.bucket.metadata
+                        )
+                        self.database.insert_object("bucket-name", blob)
+                        generation = blob.metadata.generation
+                        explicit = generation_arg == "explicit"
+                        self.database.delete_object(
+                            "bucket-name",
+                            "object",
+                            generation=str(generation) if explicit else generation_arg,
+                        )
+                        with self.assertRaises(testbench.error.RestException) as error:
+                            self.database.get_object("bucket-name", "object")
+                        self.assertEqual(error.exception.code, 404)
+                        if versioning and not explicit:
+                            archived = self.database.get_object(
+                                "bucket-name", "object", generation=generation
+                            )
+                            self.assertEqual(archived.media, b"contents")
+                            self.assertTrue(archived.metadata.HasField("delete_time"))
+                            self.assertFalse(
+                                archived.metadata.HasField("soft_delete_time")
+                            )
+                            # An explicit deletion of the noncurrent generation
+                            # now permanently deletes it or moves it to soft delete.
+                            self.database.delete_object(
+                                "bucket-name", "object", generation=generation
+                            )
+                        with self.assertRaises(testbench.error.RestException) as error:
+                            self.database.get_object(
+                                "bucket-name", "object", generation=generation
+                            )
+                        self.assertEqual(error.exception.code, 404)
+                        if soft_delete:
+                            deleted = self.database.get_object(
+                                "bucket-name",
+                                "object",
+                                generation=generation,
+                                soft_deleted=True,
+                            )
+                            self.assertEqual(deleted.media, b"contents")
+                            self.assertTrue(
+                                deleted.metadata.HasField("soft_delete_time")
+                            )
+
+    def test_delete_old_generation_preserves_live_replacement(self):
+        self.bucket.metadata.versioning.enabled = True
+        blobs = []
+        for media in (b"old", b"replacement"):
+            request = testbench.common.FakeRequest(
+                args={"name": "object"}, data=media, headers={}, environ={}
+            )
+            blob, _ = gcs.object.Object.init_media(request, self.bucket.metadata)
+            self.database.insert_object("bucket-name", blob)
+            blobs.append(blob)
+        self.database.delete_object(
+            "bucket-name", "object", generation=str(blobs[0].metadata.generation)
+        )
+        self.assertEqual(
+            self.database.get_object("bucket-name", "object").media, b"replacement"
+        )
+        with self.assertRaises(testbench.error.RestException) as error:
+            self.database.delete_object(
+                "bucket-name", "object", generation=blobs[0].metadata.generation
+            )
+        self.assertEqual(error.exception.code, 404)
+        self.assertEqual(
+            self.database.get_object("bucket-name", "object").metadata.generation,
+            blobs[1].metadata.generation,
+        )
+
     def test_object_crud(self):
         request = testbench.common.FakeRequest(
             args={"name": "object-name"}, data=b"12345678", headers={}, environ={}
