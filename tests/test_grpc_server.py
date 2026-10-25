@@ -828,6 +828,34 @@ class TestGrpc(unittest.TestCase):
         names = {o.name for o in items}
         self.assertNotIn("object-name", names)
 
+    def test_delete_live_version_retains_generation(self):
+        self.bucket.metadata.versioning.enabled = True
+        request = testbench.common.FakeRequest(
+            args={"name": "object"}, data=b"contents", headers={}, environ={}
+        )
+        blob, _ = gcs.object.Object.init_media(request, self.bucket.metadata)
+        self.db.insert_object("bucket-name", blob)
+        request = storage_pb2.DeleteObjectRequest(
+            bucket=self.bucket.metadata.name, object="object"
+        )
+        self.grpc.DeleteObject(request, self.mock_context())
+        with self.assertRaises(testbench.error.RestException) as error:
+            self.db.get_object("bucket-name", "object")
+        self.assertEqual(error.exception.code, 404)
+        get = storage_pb2.GetObjectRequest(
+            bucket=self.bucket.metadata.name,
+            object="object",
+            generation=blob.metadata.generation,
+        )
+        archived = self.grpc.GetObject(get, self.mock_context())
+        self.assertEqual(archived.generation, blob.metadata.generation)
+        self.assertTrue(archived.HasField("delete_time"))
+        request.generation = archived.generation
+        self.grpc.DeleteObject(request, self.mock_context())
+        with self.assertRaises(testbench.error.RestException) as error:
+            self.db.get_object("bucket-name", "object", generation=archived.generation)
+        self.assertEqual(error.exception.code, 404)
+
     def test_cancel_resumable_write_not_found(self):
         context = unittest.mock.Mock()
         _ = self.grpc.CancelResumableWrite(
