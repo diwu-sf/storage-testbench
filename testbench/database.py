@@ -497,16 +497,29 @@ class Database:
         preconditions=[],
     ):
         with self._resources_lock:
+            generation = int(generation or 0)
             blob, live_generation = self.__get_object(
                 bucket_name, object_name, context, generation, preconditions
             )
             # _get_object() raises if the object is not found or the generation mismatches.
-            # There are only two cases:
-            if generation == 0 or live_generation == generation:
+            if blob is None:
+                return
+            if live_generation == blob.metadata.generation:
                 self.__del_live_generation(bucket_name, object_name, context)
             bucket = self.__get_bucket_for_object(bucket_name, context)
             bucket_with_metadata = self.get_bucket(bucket_name, context)
-            if bucket_with_metadata.metadata.HasField("soft_delete_policy"):
+            # Deleting the live version without a generation archives it when
+            # versioning is enabled. An explicit generation always removes that
+            # version (or soft-deletes it), including when it is the live version.
+            if generation == 0 and bucket_with_metadata.metadata.versioning.enabled:
+                blob.metadata.delete_time.FromDatetime(
+                    datetime.datetime.now(datetime.timezone.utc)
+                )
+                return
+            if (
+                bucket_with_metadata.metadata.soft_delete_policy.retention_duration.seconds
+                > 0
+            ):
                 self.__soft_delete_object(
                     bucket_name,
                     object_name,

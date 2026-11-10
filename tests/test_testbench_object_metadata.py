@@ -148,6 +148,29 @@ class TestTestbenchObjectMetadata(unittest.TestCase):
         response = self.client.get("/storage/v1/b/bucket-name/o/fox.txt")
         self.assertEqual(response.status_code, 404)
 
+    def test_delete_live_version_retains_generation(self):
+        response = self.client.post(
+            "/storage/v1/b",
+            json={"name": "bucket-name", "versioning": {"enabled": True}},
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        response = self.client.post(
+            "/upload/storage/v1/b/bucket-name/o?uploadType=media&name=object",
+            data=b"contents",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        generation = response.json["generation"]
+        path = "/storage/v1/b/bucket-name/o/object"
+        self.assertEqual(self.client.delete(path).status_code, 200)
+        self.assertEqual(self.client.get(path).status_code, 404)
+        version_path = path + "?generation=" + generation
+        response = self.client.get(version_path)
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertIn("timeDeleted", response.json)
+        self.assertEqual(response.json["generation"], generation)
+        self.assertEqual(self.client.delete(version_path).status_code, 200)
+        self.assertEqual(self.client.get(version_path).status_code, 404)
+
     def test_object_acl_crud(self):
         response = self.client.post(
             "/storage/v1/b", data=json.dumps({"name": "bucket-name"})

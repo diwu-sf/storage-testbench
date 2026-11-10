@@ -303,6 +303,9 @@ curl -H "x-retry-test-id: 1d05c20627844214a9ff7cbcf696317d" "http://localhost:91
 | redirect-send-handle-and-token-T          | [HTTP] Unsupported [GRPC] Testbench will fail the RPC with `ABORTED` and include appropriate redirection error details.
 | return-X-if-dp-enforced                   | [HTTP] Unsupported [GRPC] Testbench will fail with the equivalent gRPC error to the HTTP code provided for X, but only if DirectPath is enforced.
 
+For XML multi-object deletes (`POST /BUCKET?delete`), use `storage.objects.delete`. Each instruction
+applies once to the whole bulk request, before any objects are deleted.
+
 ## Storage Control API Stall Support
 
 The testbench supports stall functionality for the Storage Control API (gRPC only) to test client retry behavior. All folder operations and storage layout operations can be delayed using the `x-goog-emulator-instructions` metadata header.
