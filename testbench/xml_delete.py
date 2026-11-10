@@ -14,9 +14,51 @@
 
 """The bucket-level XML multi-object delete protocol.
 
-The behavior, including error codes, messages, and precedence, mirrors what
-live GCS returns. See README.md for the list of edge cases and deliberate
-differences.
+Handles `POST /BUCKET?delete` (and the bucket subdomain's `POST /?delete`), see
+https://cloud.google.com/storage/docs/xml-api/post-bucket. The behavior,
+including error codes, messages, and precedence, mirrors what live GCS returned
+when probed on 2026-11-10:
+
+- Request errors are reported in this order: checksum headers, XML syntax and
+  schema (`MalformedMultiObjectDeleteRequest`), mismatched `VersionId` and
+  `Generation`, no objects, more than 1,000 objects (counted before duplicates
+  are removed), a missing bucket (`NoSuchBucket`), and finally an empty key
+  (`InvalidObjectName`). A rejected request deletes nothing.
+- The request needs a Base64 MD5 of the body in `Content-MD5` or
+  `x-goog-hash: md5=...`, or a Base64 big-endian CRC32 in
+  `x-amz-checksum-crc32`. CRC32C alone is not enough. All supplied MD5 and
+  CRC32 checksums are checked.
+- The body is always decoded as UTF-8: encoding declarations are ignored and
+  invalid bytes become U+FFFD. Byte order marks, and therefore UTF-16 bodies,
+  are rejected. Internal DTD subsets and entities are accepted. External DTDs
+  and entities are never loaded: documents that declare external or parameter
+  entities, or reference entities an external DTD would define, are rejected.
+- The document may use no namespace, or the default namespace `NAMESPACE`.
+  Namespace prefixes pass validation but GCS ignores prefixed child elements:
+  a prefixed `VersionId`, `Generation` or `Quiet` is ignored, a prefixed `Key`
+  leaves the object unnamed, and a prefixed `Object` is skipped. If an
+  unprefixed field is inside a prefixed `Object`, GCS fails with an empty 503.
+- Keys are trimmed of whitespace as defined by Guava's
+  `CharMatcher.whitespace()`. Carriage returns in keys are returned unescaped.
+- `Quiet` suppresses `Deleted` entries only when its text equals `true`
+  ignoring case. Missing objects and generations are reported as `Deleted`.
+  The response lists `Deleted` entries and then `Error` entries, each sorted by
+  key.
+- Identical targets are collapsed, with generations compared numerically.
+  Explicit generations are echoed in both `Generation` and `VersionId`.
+  Explicit generation zero removes the live generation (even in a versioned
+  bucket) and reports that generation, or `0` if there is none. A key named by
+  several entries also reports the generation each `Deleted` entry resolved
+  to. If two entries resolve to the same existing generation and both
+  deletions succeed, GCS still applies every deletion but reports
+  `InternalError` for every entry that targeted an existing object, including
+  unrelated keys. The final state then depends on a race in GCS; the testbench
+  applies entries in request order.
+- Holds and unexpired retention produce per-object `ObjectUnderActiveHold` and
+  `RetentionPolicyNotMet` errors.
+
+Known differences: schema error diagnostics are not reproduced, IAM is not
+enforced, and XML 1.1 documents are not supported.
 """
 
 import base64

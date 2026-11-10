@@ -18,7 +18,6 @@ is expected to be used by Storage library maintainers.
     - [Run the testbench](#run-the-testbench)
     - [Start the gRPC server](#start-the-gRPC-server)
     - [Check that the testbench is running](#check-that-the-testbench-is-running)
-    - [XML multi-object deletion](#xml-multi-object-deletion)
   - [Updating Proto Files](#updating-proto-files)
   - [Force Failures](#force-failures)
     - [return-broken-stream](#return-broken-stream)
@@ -123,89 +122,6 @@ curl -X GET localhost:9000
 The response you get should be: `OK`
 
 Now you can use the testbench (while it's running) with the client libraries.
-
-### XML multi-object deletion
-
-The testbench supports the [GCS XML multi-object delete API](https://cloud.google.com/storage/docs/xml-api/post-bucket)
-through `POST /BUCKET?delete` (also `/BUCKET/?delete`) and the bucket subdomain's
-`POST /?delete` endpoint. Additional query parameters are allowed. Objects uploaded
-through JSON, XML, or Storage v2 gRPC share the same database and can be deleted
-with this operation.
-
-Send a `Delete` document containing 1–1,000 `Object` elements, each with a `Key`
-and an optional decimal `VersionId` or `Generation` (if both are present they must
-be equal). Keys are XML text: escape XML special characters, but do not URL-encode
-names. The request needs a Base64 MD5 of the exact body in `Content-MD5` or
-`x-goog-hash: md5=...`, or a Base64 big-endian CRC32 in `x-amz-checksum-crc32`.
-CRC32C alone does not satisfy this operation's checksum requirement. All supplied
-MD5 and CRC32 checksums are checked.
-
-For example, after creating a bucket and object:
-
-```python
-import base64
-import hashlib
-import requests
-
-body = b"<Delete><Object><Key>example.txt</Key></Object></Delete>"
-response = requests.post(
-    "http://localhost:9000/my-bucket?delete",
-    data=body,
-    headers={"Content-MD5": base64.b64encode(hashlib.md5(body).digest()).decode()},
-)
-response.raise_for_status()
-print(response.text)  # Inspect per-object Error elements even when HTTP is 200.
-```
-
-The testbench reproduces these behaviors of live GCS (probed on 2026-11-10):
-
-- Request errors are reported in this order: checksum headers, XML syntax and
-  schema (`MalformedMultiObjectDeleteRequest`), mismatched `VersionId` and
-  `Generation`, no objects, more than 1,000 objects (counted before duplicates
-  are removed), a missing bucket (`NoSuchBucket`), and finally an empty key
-  (`InvalidObjectName`). A rejected request deletes nothing. Error codes, messages
-  and most `Details` match GCS; schema diagnostics are not reproduced.
-- The body is always decoded as UTF-8: encoding declarations are ignored and
-  invalid bytes become U+FFFD. Byte order marks, and therefore UTF-16 bodies, are
-  rejected. Internal DTD subsets and entities are accepted. External DTDs and
-  entities are never loaded: documents that declare external or parameter
-  entities, or reference entities an external DTD would define, are rejected.
-- The document may use no namespace, or the default namespace
-  `http://s3.amazonaws.com/doc/2006-03-01/`. Namespace prefixes pass validation
-  but GCS ignores prefixed child elements: a prefixed `VersionId`, `Generation`
-  or `Quiet` is ignored, a prefixed `Key` leaves the object unnamed, and a
-  prefixed `Object` is skipped. If an unprefixed field is inside a prefixed
-  `Object`, GCS fails with an empty 503 response.
-- Keys are trimmed of whitespace as defined by Guava's `CharMatcher.whitespace()`.
-  This includes NBSP and other Unicode spaces, but not U+200B or U+FEFF.
-  Carriage returns in keys are returned unescaped.
-- `Quiet` suppresses `Deleted` entries only when its text equals `true` ignoring
-  case. Missing objects and generations are reported as `Deleted`. The response
-  lists `Deleted` entries and then `Error` entries, each sorted by key.
-- Identical targets are collapsed, with generations compared numerically.
-  Explicit generations are echoed in both `Generation` and `VersionId`. Explicit
-  generation zero removes the live generation (even in a versioned bucket) and
-  reports that generation, or `0` if there is none. A key named by several entries
-  also reports the generation each `Deleted` entry resolved to. If two entries
-  resolve to the same existing generation and both deletions succeed, GCS still
-  applies every deletion but reports `InternalError` for every entry that targeted
-  an existing object, including unrelated keys. The final state in that case
-  depends on a race in GCS; the testbench applies entries in request order.
-- Temporary holds, event-based holds and unexpired retention (bucket retention
-  policy or object retention) produce per-object `ObjectUnderActiveHold` and
-  `RetentionPolicyNotMet` errors.
-- Deleting without a generation in a versioned bucket makes the live object
-  noncurrent. Deleting an explicit generation removes that version, and soft
-  delete retains removed versions when enabled. These transitions use the shared
-  JSON/gRPC backend.
-
-Known differences: the testbench retains overwritten generations in unversioned
-buckets, it does not mark overwritten generations as noncurrent in versioned
-buckets, it does not enforce IAM, and it does not support XML 1.1 documents.
-
-For retry testing, use `storage.objects.delete` with transport `HTTP` and the
-`x-retry-test-id` header. Each instruction applies once to the whole bulk request;
-for example, `return-503` returns an XML `SlowDown` error before any deletions.
 
 ## Updating Proto Files
 
@@ -362,6 +278,9 @@ curl -H "x-retry-test-id: 1d05c20627844214a9ff7cbcf696317d" "http://localhost:91
 | redirect-send-token-T                     | [HTTP] Unsupported [GRPC] Testbench will fail the RPC with `ABORTED` and include appropriate redirection error details.
 | redirect-send-handle-and-token-T          | [HTTP] Unsupported [GRPC] Testbench will fail the RPC with `ABORTED` and include appropriate redirection error details.
 | return-X-if-dp-enforced                   | [HTTP] Unsupported [GRPC] Testbench will fail with the equivalent gRPC error to the HTTP code provided for X, but only if DirectPath is enforced.
+
+For XML multi-object deletes (`POST /BUCKET?delete`), use `storage.objects.delete`. Each instruction
+applies once to the whole bulk request, before any objects are deleted.
 
 ## Storage Control API Stall Support
 
