@@ -133,13 +133,12 @@ through JSON, XML, or Storage v2 gRPC share the same database and can be deleted
 with this operation.
 
 Send a `Delete` document containing 1–1,000 `Object` elements, each with a `Key`
-and optional decimal `VersionId`. Keys are XML text: escape XML special characters,
-but do not URL-encode names. As in GCS, surrounding XML whitespace is trimmed from
-keys. Both unqualified elements and the default namespace
-`http://s3.amazonaws.com/doc/2006-03-01/` are supported. The request needs a Base64
-MD5 of the exact body in `Content-MD5` or `x-goog-hash: md5=...`, or a Base64
-big-endian CRC32 in `x-amz-checksum-crc32`. CRC32C alone does not satisfy this
-operation's checksum requirement. All supplied MD5 and CRC32 checksums are checked.
+and an optional decimal `VersionId` or `Generation` (if both are present they must
+be equal). Keys are XML text: escape XML special characters, but do not URL-encode
+names. The request needs a Base64 MD5 of the exact body in `Content-MD5` or
+`x-goog-hash: md5=...`, or a Base64 big-endian CRC32 in `x-amz-checksum-crc32`.
+CRC32C alone does not satisfy this operation's checksum requirement. All supplied
+MD5 and CRC32 checksums are checked.
 
 For example, after creating a bucket and object:
 
@@ -158,22 +157,51 @@ response.raise_for_status()
 print(response.text)  # Inspect per-object Error elements even when HTTP is 200.
 ```
 
-Missing objects and generations are acknowledged, duplicate targets are collapsed,
-and responses can contain both `Deleted` and `Error` elements. Response order is
-not a contract. `Quiet` suppresses successes only when its text equals `true`
-ignoring case; other values leave the response verbose. Explicit generations are
-returned in both `Generation` and `VersionId`. Explicit generation zero selects
-the live generation for removal, including in versioned buckets. A missing bucket
-or an invalid envelope rejects the whole request before
-deleting any objects. Temporary and event-based holds produce per-object errors.
+The testbench reproduces these behaviors of live GCS (probed on 2026-11-10):
 
-Deleting without a generation in a versioned bucket makes the live object
-noncurrent. Explicit generation deletion removes that version; soft delete retains
-removed versions when enabled. These transitions use the shared JSON/gRPC backend.
-The testbench still retains overwritten generations in unversioned buckets and
-does not enforce IAM or retention periods. DTDs and entities are deliberately
-rejected. Error messages and schema diagnostics are simplified. Protocol edge
-cases were checked against live GCS on 2026-10-25.
+- Request errors are reported in this order: checksum headers, XML syntax and
+  schema (`MalformedMultiObjectDeleteRequest`), mismatched `VersionId` and
+  `Generation`, no objects, more than 1,000 objects (counted before duplicates
+  are removed), a missing bucket (`NoSuchBucket`), and finally an empty key
+  (`InvalidObjectName`). A rejected request deletes nothing. Error codes, messages
+  and most `Details` match GCS; schema diagnostics are not reproduced.
+- The body is always decoded as UTF-8: encoding declarations are ignored and
+  invalid bytes become U+FFFD. Byte order marks, and therefore UTF-16 bodies, are
+  rejected. Internal DTD subsets and entities are accepted. External DTDs and
+  entities are never loaded: documents that declare external or parameter
+  entities, or reference entities an external DTD would define, are rejected.
+- The document may use no namespace, or the default namespace
+  `http://s3.amazonaws.com/doc/2006-03-01/`. Namespace prefixes pass validation
+  but GCS ignores prefixed child elements: a prefixed `VersionId`, `Generation`
+  or `Quiet` is ignored, a prefixed `Key` leaves the object unnamed, and a
+  prefixed `Object` is skipped. If an unprefixed field is inside a prefixed
+  `Object`, GCS fails with an empty 503 response.
+- Keys are trimmed of whitespace as defined by Guava's `CharMatcher.whitespace()`.
+  This includes NBSP and other Unicode spaces, but not U+200B or U+FEFF.
+  Carriage returns in keys are returned unescaped.
+- `Quiet` suppresses `Deleted` entries only when its text equals `true` ignoring
+  case. Missing objects and generations are reported as `Deleted`. The response
+  lists `Deleted` entries and then `Error` entries, each sorted by key.
+- Identical targets are collapsed, with generations compared numerically.
+  Explicit generations are echoed in both `Generation` and `VersionId`. Explicit
+  generation zero removes the live generation (even in a versioned bucket) and
+  reports that generation, or `0` if there is none. A key named by several entries
+  also reports the generation each `Deleted` entry resolved to. If two entries
+  resolve to the same existing generation and both deletions succeed, GCS still
+  applies every deletion but reports `InternalError` for every entry that targeted
+  an existing object, including unrelated keys. The final state in that case
+  depends on a race in GCS; the testbench applies entries in request order.
+- Temporary holds, event-based holds and unexpired retention (bucket retention
+  policy or object retention) produce per-object `ObjectUnderActiveHold` and
+  `RetentionPolicyNotMet` errors.
+- Deleting without a generation in a versioned bucket makes the live object
+  noncurrent. Deleting an explicit generation removes that version, and soft
+  delete retains removed versions when enabled. These transitions use the shared
+  JSON/gRPC backend.
+
+Known differences: the testbench retains overwritten generations in unversioned
+buckets, it does not mark overwritten generations as noncurrent in versioned
+buckets, it does not enforce IAM, and it does not support XML 1.1 documents.
 
 For retry testing, use `storage.objects.delete` with transport `HTTP` and the
 `x-retry-test-id` header. Each instruction applies once to the whole bulk request;

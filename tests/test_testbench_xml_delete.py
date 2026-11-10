@@ -166,9 +166,20 @@ class TestXmlDelete(unittest.TestCase):
             "<Delete><Object><Key attr='x'>object</Key></Object></Delete>",
             "<Delete>" + valid + "<Quiet><Nested/></Quiet></Delete>",
             "<Delete xmlns='urn:unknown'>" + valid + "</Delete>",
-            "<!DOCTYPE Delete><Delete>" + valid + "</Delete>",
-            "<!DOCTYPE Delete [<!ENTITY key 'object'>]><Delete><Object><Key>&key;</Key></Object></Delete>",
-            "<!DOCTYPE Delete SYSTEM 'file:///not-read'><Delete>" + valid + "</Delete>",
+            "<Delete>" + valid + "<Object><Key>&undefined;</Key></Object></Delete>",
+            "<!DOCTYPE Delete [<!ATTLIST Delete a CDATA 'x'>]><Delete>"
+            + valid
+            + "</Delete>",
+            # External entities are never loaded.
+            "<!DOCTYPE Delete [<!ENTITY key SYSTEM 'file:///not-read'>]>"
+            "<Delete><Object><Key>&key;</Key></Object></Delete>",
+            "<!DOCTYPE Delete SYSTEM 'file:///not-read'>"
+            "<Delete><Object><Key>&key;</Key></Object></Delete>",
+            "<!DOCTYPE Delete [<!ENTITY % p 'x'>]><Delete>" + valid + "</Delete>",
+            # Like GCS, byte order marks, NUL, and UTF-16 are not accepted.
+            b"\xef\xbb\xbf<Delete>" + valid.encode() + b"</Delete>",
+            ("<Delete>" + valid + "</Delete>").encode("utf-16-le"),
+            "<Delete>" + valid + "\0</Delete>",
         ):
             with self.subTest(body=body):
                 self.assert_error(
@@ -369,8 +380,15 @@ class TestXmlDelete(unittest.TestCase):
         ]
         for name in names:
             self.put(name)
-        result = self.result(self.post(self.body([(name, None) for name in names])))
-        self.assertCountEqual([e.findtext(NS + "Key") for e in result], names)
+        response = self.post(self.body([(name, None) for name in names]))
+        result = self.result(response)
+        # Like GCS, carriage returns in keys are not escaped in the response, so
+        # XML parsers normalize them to line feeds.
+        self.assertIn(b"<Key>carriage\rreturn</Key>", response.data)
+        self.assertCountEqual(
+            [e.findtext(NS + "Key") for e in result],
+            [name.replace("\r", "\n") for name in names],
+        )
         for name in names:
             self.assertEqual(self.get(name).status_code, 404, name)
 
@@ -605,3 +623,397 @@ class TestXmlDelete(unittest.TestCase):
             timeout=10,
         )
         self.assertEqual(replacement.generation, new)
+
+    # The following tests pin behavior observed against live GCS.
+
+    def post_raw(self, body, **kwargs):
+        if isinstance(body, str):
+            body = body.encode()
+        return self.post(body, **kwargs)
+
+    def test_response_format(self):
+        self.put("object")
+        response = self.post(self.body([("object", None)]))
+        self.assertEqual(
+            response.headers["Content-Type"], "application/xml; charset=UTF-8"
+        )
+        self.assertEqual(
+            response.data,
+            b"<?xml version='1.0' encoding='UTF-8'?>"
+            b"<DeleteResult xmlns='http://s3.amazonaws.com/doc/2006-03-01/'>"
+            b"<Deleted><Key>object</Key></Deleted></DeleteResult>",
+        )
+        response = self.post(self.body([("object", None)], quiet="true"))
+        self.assertEqual(
+            response.data,
+            b"<?xml version='1.0' encoding='UTF-8'?>"
+            b"<DeleteResult xmlns='http://s3.amazonaws.com/doc/2006-03-01/'/>",
+        )
+        response = self.post(self.body([("object", None)] * 1001))
+        self.assertEqual(
+            response.data,
+            b"<?xml version='1.0' encoding='UTF-8'?><Error>"
+            b"<Code>InvalidMultiObjectDeleteRequest</Code>"
+            b"<Message>The multi-object delete request was invalid.</Message>"
+            b"<Details>Too many objects; limit is 1000.</Details></Error>",
+        )
+
+    def test_checksum_header_details(self):
+        body = self.body([("object", None)])
+        md5 = base64.b64encode(hashlib.md5(body).digest()).decode()
+        crc = base64.b64encode(zlib.crc32(body).to_bytes(4, "big")).decode()
+        other = base64.b64encode(hashlib.md5(b"other").digest()).decode()
+        for headers in (
+            {"Content-MD5": md5.rstrip("=")},
+            {"x-amz-checksum-crc32": crc.rstrip("=")},
+            {"x-goog-hash": "crc32c=!!, md5=" + md5},
+        ):
+            with self.subTest(headers=headers):
+                self.put("object")
+                self.result(self.post(body, headers=headers))
+        self.put("object")
+        for headers, code, details in (
+            (
+                {"Content-MD5": md5, "x-goog-hash": "MD5=" + md5},
+                "UnsupportedHash",
+                "Unsupported hash type: MD5",
+            ),
+            (
+                {"Content-MD5": other, "x-goog-hash": "sha1=x"},
+                "UnsupportedHash",
+                "Unsupported hash type: sha1",
+            ),
+            (
+                {"Content-MD5": md5, "x-goog-hash": "garbage"},
+                "InvalidHash",
+                "Invalid hash entry: garbage",
+            ),
+            (
+                {"Content-MD5": "a-_aaaaaaaaaaaaaaaaaaa"},
+                "InvalidDigest",
+                "Invalid MD5 value: a-_aaaaaaaaaaaaaaaaaaa",
+            ),
+            (
+                {"Content-MD5": other, "x-goog-hash": "md5=" + md5},
+                "BadDigest",
+                "The MD5 hashes in Content-MD5 (%s) and x-goog-hash (%s) don't match."
+                % (hashlib.md5(b"other").hexdigest(), hashlib.md5(body).hexdigest()),
+            ),
+            (
+                {"Content-MD5": other, "x-goog-hash": "md5=" + other},
+                "BadDigest",
+                "The specified Content-MD5 does not match what we computed.",
+            ),
+            (
+                {"Content-MD5": "AAAA", "x-amz-checksum-crc32": crc},
+                "InvalidDigest",
+                "Invalid MD5 value: AAAA",
+            ),
+            (
+                {},
+                "InvalidRequest",
+                "Missing required header for this request: Content-MD5 OR x-amz-checksum-crc32.",
+            ),
+        ):
+            with self.subTest(headers=headers):
+                response = self.post(body, headers=headers)
+                self.assert_error(response, 400, code)
+                self.assertEqual(
+                    ET.fromstring(response.data).findtext("Details"), details
+                )
+                self.assertEqual(self.get("object").status_code, 200)
+        # Checksums are validated before the bucket is looked up.
+        self.assert_error(
+            self.post(body, "/missing-bucket?delete", headers={}), 400, "InvalidRequest"
+        )
+
+    def test_dtds_are_accepted_without_external_resources(self):
+        valid = "<Object><Key>object</Key></Object>"
+        for body in (
+            "<!DOCTYPE Delete><Delete>" + valid + "</Delete>",
+            "<!DOCTYPE Other><Delete>" + valid + "</Delete>",
+            "<!DOCTYPE Delete [<!ENTITY key 'object'>]>"
+            "<Delete><Object><Key>&key;</Key></Object></Delete>",
+            "<!DOCTYPE Delete [<!ENTITY o '<Object><Key>object</Key></Object>'>]>"
+            "<Delete>&o;</Delete>",
+            # GCS accepts an external subset that is not needed.
+            "<!DOCTYPE Delete SYSTEM 'file:///not-read'><Delete>" + valid + "</Delete>",
+        ):
+            with self.subTest(body=body):
+                self.put("object")
+                self.result(self.post(body))
+                self.assertEqual(self.get("object").status_code, 404)
+
+    def test_body_is_always_utf8(self):
+        self.put("é")
+        # The encoding declaration is ignored: these bytes are not valid UTF-8,
+        # so GCS replaces them and deletes a different (missing) object.
+        body = (
+            '<?xml version="1.0" encoding="ISO-8859-1"?>'
+            "<Delete><Object><Key>é</Key></Object></Delete>"
+        ).encode("latin-1")
+        result = self.result(self.post(body))
+        self.assertEqual(result.findtext(NS + "Deleted/" + NS + "Key"), "\ufffd")
+        self.assertEqual(self.get("é").status_code, 200)
+        body = (
+            '<?xml version="1.0" encoding="UTF-16"?>'
+            "<Delete><Object><Key>é</Key></Object></Delete>"
+        ).encode("utf-8")
+        self.result(self.post(body))
+        self.assertEqual(self.get("é").status_code, 404)
+
+    def test_generation_element(self):
+        bucket = rest_server.db.get_bucket("bucket-name", None)
+        bucket.metadata.versioning.enabled = True
+        old = self.put("object")
+        new = self.put("object")
+        for fields in (
+            "<Generation>%s</Generation><Key>object</Key>" % old,
+            "<Key>object</Key><Generation>%s</Generation><VersionId>+0%s</VersionId>"
+            % (old, old),
+        ):
+            with self.subTest(fields=fields):
+                result = self.result(
+                    self.post("<Delete><Object>%s</Object></Delete>" % fields)
+                )
+                self.assertEqual(result[0].findtext(NS + "Generation"), old)
+                self.assertEqual(result[0].findtext(NS + "VersionId"), old)
+        for fields in (
+            "<Key>object</Key><Generation>%s</Generation><VersionId>%s</VersionId>"
+            % (old, new),
+            "<Key>object</Key><VersionId>%s</VersionId><Generation>0</Generation>"
+            % new,
+        ):
+            with self.subTest(fields=fields):
+                response = self.post("<Delete><Object>%s</Object></Delete>" % fields)
+                self.assert_error(response, 400, "InvalidMultiObjectDeleteRequest")
+                self.assertEqual(
+                    ET.fromstring(response.data).findtext("Details"),
+                    "Both VersionId and Generation are set for the same object and do not match.",
+                )
+                self.assertEqual(self.get("object").json["generation"], new)
+        for body in (
+            "<Delete><Object><Key>object</Key><Generation>1</Generation>"
+            "<Generation>1</Generation></Object></Delete>",
+            "<Delete><Object><Key>object</Key><Generation>x</Generation></Object></Delete>",
+        ):
+            self.assert_error(self.post(body), 400, "MalformedMultiObjectDeleteRequest")
+
+    def test_prefixed_elements_are_ignored(self):
+        bucket = rest_server.db.get_bucket("bucket-name", None)
+        bucket.metadata.versioning.enabled = True
+        ns = "http://s3.amazonaws.com/doc/2006-03-01/"
+        decl = 'xmlns="%s" xmlns:s="%s"' % (ns, ns)
+        old = self.put("object")
+        new = self.put("object")
+        # A prefixed VersionId is ignored, so the live version is archived.
+        result = self.result(
+            self.post(
+                "<Delete %s><Object><Key>object</Key><s:VersionId>%s</s:VersionId>"
+                "</Object></Delete>" % (decl, old)
+            )
+        )
+        self.assertIsNone(result[0].find(NS + "VersionId"))
+        self.assertEqual(self.get("object").status_code, 404)
+        self.assertEqual(self.get("object", generation=old).status_code, 200)
+        self.assertEqual(self.get("object", generation=new).status_code, 200)
+        self.put("a")
+        self.put("b")
+        # Prefixed Quiet and Object elements are ignored; a prefixed root is not.
+        result = self.result(
+            self.post(
+                "<s:Delete %s><s:Quiet>true</s:Quiet><s:Object><s:Key>a</s:Key>"
+                "</s:Object><Object><Key>b</Key></Object></s:Delete>" % decl
+            )
+        )
+        self.assertEqual([e.findtext(NS + "Key") for e in result], ["b"])
+        self.assertEqual(self.get("a").status_code, 200)
+        # Without any bound Object the request is invalid, before the bucket
+        # is checked.
+        response = self.post(
+            '<s:Delete xmlns:s="%s"><s:Object><s:Key>a</s:Key></s:Object></s:Delete>'
+            % ns,
+            "/missing-bucket?delete",
+        )
+        self.assert_error(response, 400, "InvalidArgument")
+        self.assertEqual(
+            ET.fromstring(response.data).findtext("Details"),
+            "Specify at least one object name.",
+        )
+        # A prefixed Key leaves the Object without a name.
+        body = "<Delete %s><Object><s:Key>a</s:Key></Object></Delete>" % decl
+        self.assert_error(
+            self.post(body, "/missing-bucket?delete"), 404, "NoSuchBucket"
+        )
+        self.assert_error(self.post(body), 400, "InvalidObjectName")
+        # Unprefixed fields inside an ignored Object fail with an empty 503.
+        for field in ("<Key>a</Key>", "<s:Key>a</s:Key><VersionId>1</VersionId>"):
+            with self.subTest(field=field):
+                response = self.post(
+                    "<Delete %s><s:Object>%s</s:Object></Delete>" % (decl, field)
+                )
+                self.assertEqual(response.status_code, 503)
+                self.assertEqual(response.data, b"")
+        self.assertEqual(self.get("a").status_code, 200)
+
+    def test_request_error_precedence(self):
+        mismatch = "<Object><Key>a</Key><Generation>1</Generation><VersionId>2</VersionId></Object>"
+        many = "<Object><Key>n</Key></Object>" * 1001
+        for body, path, status, code in (
+            (
+                "<x/>",
+                "/missing-bucket?delete",
+                400,
+                "MalformedMultiObjectDeleteRequest",
+            ),
+            (
+                "<Delete>%s%s<Object><Key>b</Key><VersionId>x</VersionId></Object></Delete>"
+                % (mismatch, many),
+                None,
+                400,
+                "MalformedMultiObjectDeleteRequest",
+            ),
+            (
+                "<Delete>" + mismatch + many + "</Delete>",
+                None,
+                400,
+                "InvalidMultiObjectDeleteRequest",
+            ),
+            (
+                "<Delete>" + many + "</Delete>",
+                "/missing-bucket?delete",
+                400,
+                "InvalidMultiObjectDeleteRequest",
+            ),
+            (
+                "<Delete><Object><Key/></Object></Delete>",
+                "/missing-bucket?delete",
+                404,
+                "NoSuchBucket",
+            ),
+        ):
+            with self.subTest(body=body[:80], path=path):
+                kwargs = {"path": path} if path else {}
+                self.assert_error(self.post(body, **kwargs), status, code)
+
+    def test_key_trimming_uses_unicode_whitespace(self):
+        for space in ("\u00a0", "\u2003", "\u3000", "\u0085", "\u2028", "\u202f"):
+            with self.subTest(space=repr(space)):
+                self.put("object")
+                self.result(self.post(self.body([(space + "object" + space, None)])))
+                self.assertEqual(self.get("object").status_code, 404)
+        for other in ("\u200b", "\u180e", "\ufeff", "\u00ad"):
+            with self.subTest(other=repr(other)):
+                self.put("object")
+                result = self.result(self.post(self.body([("object" + other, None)])))
+                self.assertEqual(result[0].findtext(NS + "Key"), "object" + other)
+                self.assertEqual(self.get("object").status_code, 200)
+        self.assert_error(
+            self.post(self.body([("\u3000", None)])), 400, "InvalidObjectName"
+        )
+
+    def test_repeated_keys_report_resolved_generations(self):
+        bucket = rest_server.db.get_bucket("bucket-name", None)
+        bucket.metadata.versioning.enabled = True
+        old = self.put("object")
+        new = self.put("object")
+        result = self.result(self.post(self.body([("object", None), ("object", old)])))
+        self.assertCountEqual(
+            [e.findtext(NS + "VersionId") for e in result.findall(NS + "Deleted")],
+            [old, new],
+        )
+        self.assertEqual(self.get("object", generation=new).status_code, 200)
+        self.assertEqual(self.get("object", generation=old).status_code, 404)
+        result = self.result(
+            self.post(
+                self.body([("missing", None), ("missing", "0"), ("missing", "5")])
+            )
+        )
+        self.assertCountEqual(
+            [e.findtext(NS + "VersionId") for e in result], ["0", "0", "5"]
+        )
+
+    def test_conflicting_targets_report_internal_errors(self):
+        generation = self.put("object")
+        self.put("other")
+        self.put("held")
+        self.client.patch(
+            "/storage/v1/b/bucket-name/o/held", json={"temporaryHold": True}
+        )
+        result = self.result(
+            self.post(
+                self.body(
+                    [
+                        ("object", None),
+                        ("object", generation),
+                        ("other", None),
+                        ("held", None),
+                        ("missing", None),
+                    ]
+                )
+            )
+        )
+        self.assertEqual(
+            [(e.tag, e.findtext(NS + "Key"), e.findtext(NS + "Code")) for e in result],
+            [
+                (NS + "Deleted", "missing", None),
+                (NS + "Error", "held", "InternalError"),
+                (NS + "Error", "object", "InternalError"),
+                (NS + "Error", "object", "InternalError"),
+                (NS + "Error", "other", "InternalError"),
+            ],
+        )
+        # The deletions still happen, but holds are enforced.
+        self.assertEqual(self.get("object").status_code, 404)
+        self.assertEqual(self.get("other").status_code, 404)
+        self.assertEqual(self.get("held").status_code, 200)
+        # Conflicting deletions that both fail report their own errors.
+        held = self.get("held").json["generation"]
+        result = self.result(self.post(self.body([("held", None), ("held", "0")])))
+        self.assertEqual(
+            [(e.findtext(NS + "Code"), e.findtext(NS + "VersionId")) for e in result],
+            [("ObjectUnderActiveHold", None), ("ObjectUnderActiveHold", "0")],
+        )
+        self.assertEqual(self.get("held").json["generation"], held)
+
+    def test_response_order(self):
+        for name in ("z", "held", "a", "é", "Z"):
+            self.put(name)
+        self.client.patch(
+            "/storage/v1/b/bucket-name/o/held", json={"eventBasedHold": True}
+        )
+        result = self.result(
+            self.post(self.body([(k, None) for k in ("é", "z", "held", "a", "Z", "b")]))
+        )
+        self.assertEqual(
+            [e.findtext(NS + "Key") for e in result], ["Z", "a", "b", "z", "é", "held"]
+        )
+        self.assertEqual(
+            result[-1].findtext(NS + "Message"),
+            "Object 'bucket-name/held' is under active Event-Based hold and cannot be "
+            "deleted, overwritten or archived until hold is removed.",
+        )
+
+    def test_retention_policy(self):
+        bucket = rest_server.db.get_bucket("bucket-name", None)
+        bucket.metadata.retention_policy.retention_duration.seconds = 3600
+        generation = self.put("object")
+        result = self.result(
+            self.post(self.body([("object", None), ("object", generation)]))
+        )
+        self.assertEqual(
+            [e.findtext(NS + "Code") for e in result], ["RetentionPolicyNotMet"] * 2
+        )
+        self.assertTrue(
+            result[0]
+            .findtext(NS + "Message")
+            .startswith(
+                "Object 'bucket-name/object' is subject to bucket's retention policy "
+                "or object retention and cannot be deleted or overwritten until "
+            )
+        )
+        self.assertEqual(self.get("object").status_code, 200)
+        bucket.metadata.retention_policy.retention_duration.seconds = 0
+        self.put("object")
+        self.result(self.post(self.body([("object", None)])))
+        self.assertEqual(self.get("object").status_code, 404)

@@ -12,13 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The bucket-level XML multi-object delete protocol."""
+"""The bucket-level XML multi-object delete protocol.
+
+The behavior, including error codes, messages, and precedence, mirrors what
+live GCS returns. See README.md for the list of edge cases and deliberate
+differences.
+"""
 
 import base64
 import binascii
+import collections
+import datetime
 import hashlib
 import re
-import xml.etree.ElementTree as ET
 import zlib
 from xml.parsers import expat
 
@@ -27,27 +33,60 @@ import flask
 from testbench.error import RestException
 
 NAMESPACE = "http://s3.amazonaws.com/doc/2006-03-01/"
+MAX_OBJECTS = 1000
+MAX_GENERATION = 2**63 - 1
+
+# GCS trims object names with Guava's `CharMatcher.whitespace()`. Notably this
+# includes NBSP and other Unicode spaces, but not U+200B, U+180E, or U+FEFF.
+_KEY_WHITESPACE = (
+    "\t\n\u000b\u000c\r \u0085\u00a0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000"
+)
+_XML_WHITESPACE = " \t\r\n"
+
+_MALFORMED = (
+    "The XML you provided was not well-formed or did not validate against our "
+    "published schema."
+)
+_MISSING_CHECKSUM = (
+    "Missing required header for this request: Content-MD5 OR x-amz-checksum-crc32."
+)
+_MD5_MISMATCH = (
+    "The MD5 you specified in Content-MD5 or x-goog-hash did not match what we "
+    "computed."
+)
 
 
-def _response(element, status=200):
-    # ElementTree emits literal CRs in text, which XML parsers normalize to LF.
-    # Character references preserve the object key in the response as well.
-    data = ET.tostring(element, encoding="utf-8", xml_declaration=True).replace(
-        b"\r", b"&#13;"
+def _escape(text):
+    # Like GCS, emit carriage returns literally rather than as `&#13;`.
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _response(body, status=200):
+    data = ("<?xml version='1.0' encoding='UTF-8'?>" + body).encode("utf-8")
+    return flask.Response(
+        data, status=status, content_type="application/xml; charset=UTF-8"
     )
-    return flask.Response(data, status=status, content_type="application/xml")
+
+
+def _element(tag, text):
+    return "<%s>%s</%s>" % (tag, _escape(text), tag)
 
 
 class XmlError(RestException):
-    def __init__(self, code, message, status=400):
+    def __init__(self, code, message, status=400, details=None):
         super().__init__(message, status)
         self.xml_code = code
+        self.details = details
 
     def as_response(self):
-        error = ET.Element("Error")
-        ET.SubElement(error, "Code").text = self.xml_code
-        ET.SubElement(error, "Message").text = self.msg
-        return _response(error, self.code)
+        if self.xml_code is None:
+            return flask.Response(b"", status=self.code)
+        body = _element("Code", self.xml_code) + _element("Message", self.msg)
+        if self.details is not None:
+            body += _element("Details", self.details)
+        return _response("<Error>%s</Error>" % body, self.code)
 
     @classmethod
     def from_rest(cls, error):
@@ -70,189 +109,418 @@ class XmlError(RestException):
         return cls(code, str(error.msg), status)
 
 
-def _malformed():
+def _malformed(details=None):
+    return XmlError("MalformedMultiObjectDeleteRequest", _MALFORMED, details=details)
+
+
+def _invalid_request(details):
     return XmlError(
-        "MalformedMultiObjectDeleteRequest",
-        "The XML is not a valid multi-object delete request.",
+        "InvalidMultiObjectDeleteRequest",
+        "The multi-object delete request was invalid.",
+        details=details,
     )
 
 
+def _no_such_bucket():
+    return XmlError("NoSuchBucket", "The specified bucket does not exist.", 404)
+
+
+# === CHECKSUMS === #
+
+
+def _b64decode(value, size):
+    # GCS accepts unpadded Base64 in checksum headers, but not URL-safe Base64.
+    value += "=" * (-len(value) % 4)
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error):
+        return None
+    return decoded if len(decoded) == size else None
+
+
 def _validate_checksum(data, headers):
-    md5_values = []
-    if "Content-MD5" in headers:
-        md5_values.append(headers["Content-MD5"])
-    for value in headers.get("x-goog-hash", "").split(","):
-        value = value.strip()
-        if value.startswith("md5="):
-            md5_values.append(value[4:])
+    goog_md5 = []
+    for entry in headers.get("x-goog-hash", "").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        kind, sep, value = entry.partition("=")
+        if not sep:
+            raise XmlError(
+                "InvalidHash",
+                "The x-goog-hash header you specified was invalid.",
+                details="Invalid hash entry: " + entry,
+            )
+        if kind not in ("md5", "crc32c"):
+            raise XmlError(
+                "UnsupportedHash",
+                "The x-goog-hash header you specified was invalid.",
+                details="Unsupported hash type: " + kind,
+            )
+        # x-goog-hash CRC32C values are accepted but not checked by GCS.
+        if kind == "md5":
+            goog_md5.append(value)
+    content_md5 = headers.get("Content-MD5")
     crc = headers.get("x-amz-checksum-crc32")
-    if not md5_values and crc is None:
+    if content_md5 is None and not goog_md5 and crc is None:
+        raise XmlError("InvalidRequest", _MISSING_CHECKSUM, details=_MISSING_CHECKSUM)
+
+    md5_values = ([content_md5] if content_md5 is not None else []) + goog_md5
+    decoded = {}
+    for value in md5_values:
+        digest = _b64decode(value, 16)
+        if digest is None:
+            raise XmlError(
+                "InvalidDigest",
+                "The MD5 you specified in Content-MD5 or x-goog-hash was invalid.",
+                details="Invalid MD5 value: " + value,
+            )
+        decoded[value] = digest
+    if content_md5 is not None:
+        for value in goog_md5:
+            if decoded[value] != decoded[content_md5]:
+                raise XmlError(
+                    "BadDigest",
+                    _MD5_MISMATCH,
+                    details="The MD5 hashes in Content-MD5 (%s) and x-goog-hash (%s) don't match."
+                    % (decoded[content_md5].hex(), decoded[value].hex()),
+                )
+    expected = hashlib.md5(data).digest()
+    if any(digest != expected for digest in decoded.values()):
         raise XmlError(
-            "InvalidRequest", "An MD5 or CRC32 request checksum is required."
+            "BadDigest",
+            _MD5_MISMATCH,
+            details="The specified Content-MD5 does not match what we computed.",
         )
-    checks = [(v, hashlib.md5(data).digest(), "InvalidDigest") for v in md5_values]
     if crc is not None:
-        checks.append((crc, zlib.crc32(data).to_bytes(4, "big"), "InvalidRequest"))
-    for value, expected, invalid_code in checks:
-        try:
-            digest = base64.b64decode(value, validate=True)
-        except (ValueError, binascii.Error):
-            raise XmlError(invalid_code, "The request checksum is invalid.")
-        if len(digest) != len(expected):
-            raise XmlError(invalid_code, "The request checksum is invalid.")
-        if digest != expected:
-            raise XmlError("BadDigest", "The request checksum does not match the body.")
+        digest = _b64decode(crc, 4)
+        if digest is None:
+            raise XmlError(
+                "InvalidRequest", "Value for x-amz-checksum-crc32 header is invalid."
+            )
+        if digest != zlib.crc32(data).to_bytes(4, "big"):
+            raise XmlError(
+                "BadDigest",
+                "The CRC32 you specified did not match the calculated checksum.",
+            )
+
+
+# === PARSING === #
+
+
+class _Node:
+    __slots__ = ("namespace", "name", "prefixed", "children", "text")
+
+    def __init__(self, namespace, name, prefixed):
+        self.namespace = namespace
+        self.name = name
+        self.prefixed = prefixed
+        self.children = []
+        self.text = []
 
 
 def _parse_xml(data):
-    # Retain namespace prefixes: GCS validates the namespace but rejects
-    # prefixed request elements, even when the namespace URI is correct.
+    # GCS always decodes the body as UTF-8, replacing invalid sequences and
+    # ignoring any encoding declaration. A byte order mark is not accepted.
+    # Pyexpat silently drops NUL characters, which are never valid XML.
+    text = data.decode("utf-8", errors="replace")
+    if text.startswith("\ufeff") or "\x00" in text:
+        raise _malformed()
+    # Retain prefixes: GCS validates namespaces but only binds unprefixed
+    # elements to the request.
     parser = expat.ParserCreate(namespace_separator=" ")
     parser.namespace_prefixes = True
-    tree = ET.TreeBuilder()
-    prefixed = set()
-
-    def expanded(name):
-        parts = name.split(" ")
-        return "{%s}%s" % tuple(parts[:2]) if len(parts) > 1 else name
+    stack = []
+    roots = []
 
     def start(name, attributes):
-        if len(name.split(" ")) == 3:
-            prefixed.add(expanded(name))
-        tree.start(expanded(name), attributes)
+        if attributes:
+            raise _malformed()
+        parts = name.split(" ")
+        if len(parts) == 1:
+            node = _Node(None, parts[0], False)
+        else:
+            node = _Node(parts[0], parts[1], len(parts) == 3)
+        (stack[-1].children if stack else roots).append(node)
+        stack.append(node)
 
-    def doctype(*args):
-        # Reject before any entity expansion, including in UTF-16 documents.
+    def end(name):
+        stack.pop()
+
+    def characters(data):
+        stack[-1].text.append(data)
+
+    def reject(*args):
         raise _malformed()
+
+    def entity(name, is_parameter, value, base, system_id, public_id, notation):
+        # Expat (2.4.1+) limits internal entity amplification.
+        if is_parameter or value is None or expat.version_info < (2, 4, 1):
+            raise _malformed()
 
     parser.StartElementHandler = start
-    parser.EndElementHandler = lambda name: tree.end(expanded(name))
-    parser.CharacterDataHandler = tree.data
-    parser.StartDoctypeDeclHandler = doctype
+    parser.EndElementHandler = end
+    parser.CharacterDataHandler = characters
+    # DTDs are accepted, like GCS, but external resources are never loaded:
+    # external entity declarations and references to entities that an
+    # external subset might declare are rejected.
+    parser.EntityDeclHandler = entity
+    parser.UnparsedEntityDeclHandler = reject
+    parser.ExternalEntityRefHandler = reject
+    parser.SkippedEntityHandler = reject
     try:
-        parser.Parse(data, True)
+        parser.Parse(text, True)
     except expat.ExpatError:
         raise _malformed()
-    return tree.close(), prefixed
+    return roots[0]
+
+
+def _parse_generation(text):
+    value = text.strip(_XML_WHITESPACE)
+    if not re.fullmatch(r"[+-]?[0-9]+", value):
+        raise _malformed()
+    digits = value.lstrip("+-").lstrip("0") or "0"
+    if value.startswith("-") and digits != "0":
+        raise _malformed()
+    if len(digits) > 19 or int(digits) > MAX_GENERATION:
+        raise _malformed()
+    return int(digits)
+
+
+def _validate_schema(root):
+    """Check the document against the namespace-aware request schema.
+
+    Prefixes are irrelevant here; every element must be in the same namespace
+    as `Delete`, which is either no namespace or the S3 namespace.
+    """
+    if root.namespace not in (None, NAMESPACE) or root.name != "Delete":
+        raise _malformed()
+
+    def element_only(node, allowed):
+        if "".join(node.text).strip(_XML_WHITESPACE):
+            raise _malformed()
+        counts = collections.Counter()
+        for child in node.children:
+            if child.namespace != root.namespace or child.name not in allowed:
+                raise _malformed()
+            counts[child.name] += 1
+            if counts[child.name] > allowed[child.name]:
+                raise _malformed()
+        return counts
+
+    def text_only(node):
+        if node.children:
+            raise _malformed()
+        return "".join(node.text)
+
+    counts = element_only(root, {"Quiet": 1, "Object": float("inf")})
+    if counts["Object"] == 0:
+        raise _malformed()
+    for child in root.children:
+        if child.name == "Quiet":
+            text_only(child)
+            continue
+        if element_only(child, {"Key": 1, "Generation": 1, "VersionId": 1})["Key"] != 1:
+            raise _malformed()
+        for field in child.children:
+            value = text_only(field)
+            if field.name != "Key":
+                _parse_generation(value)
+
+
+class _Request:
+    def __init__(self, entries, quiet):
+        self.entries = entries
+        self.quiet = quiet
+
+
+def _bind(root):
+    """Bind the validated document to a request, like the GCS XML binder.
+
+    Only unprefixed elements are bound; prefixed ones are silently ignored.
+    """
+    quiet = False
+    entries = []
+    for child in root.children:
+        if child.prefixed:
+            # An unprefixed field inside an ignored Object makes GCS fail
+            # with an empty 503 response.
+            if child.name == "Object" and any(not f.prefixed for f in child.children):
+                raise XmlError(None, "", 503)
+            continue
+        if child.name == "Quiet":
+            quiet = "".join(child.text).lower() == "true"
+            continue
+        key, values = "", {}
+        for field in child.children:
+            if field.prefixed:
+                continue
+            if field.name == "Key":
+                key = "".join(field.text)
+            else:
+                values[field.name] = _parse_generation("".join(field.text))
+        if len(set(values.values())) > 1:
+            raise _invalid_request(
+                "Both VersionId and Generation are set for the same object and do not match."
+            )
+        generation = next(iter(values.values()), None)
+        entries.append((key, generation))
+    if not entries:
+        raise XmlError(
+            "InvalidArgument",
+            "Invalid argument.",
+            details="Specify at least one object name.",
+        )
+    if len(entries) > MAX_OBJECTS:
+        raise _invalid_request("Too many objects; limit is %d." % MAX_OBJECTS)
+    return _Request(entries, quiet)
 
 
 def _parse_request(request):
     data = request.get_data()
     _validate_checksum(data, request.headers)
-    root, prefixed = _parse_xml(data)
-    namespace = "{%s}" % NAMESPACE if root.tag.startswith("{") else ""
-    if root.tag != namespace + "Delete":
-        raise _malformed()
-    for element in root.iter():
-        if element.attrib:
-            raise _malformed()
-        if element.tag in (namespace + "Delete", namespace + "Object"):
-            if (element.text or "").strip() or any(
-                (c.tail or "").strip() for c in element
-            ):
-                raise _malformed()
-    entries = []
-    quiet = False
-    seen_quiet = False
-    for child in root:
-        if child.tag == namespace + "Quiet" and not seen_quiet:
-            if len(child):
-                raise _malformed()
-            quiet = (child.text or "").lower() == "true"
-            seen_quiet = True
-            continue
-        if child.tag != namespace + "Object":
-            raise _malformed()
-        fields = {}
-        for field in child:
-            if (
-                field.tag not in (namespace + "Key", namespace + "VersionId")
-                or field.tag in fields
-                or len(field)
-            ):
-                raise _malformed()
-            fields[field.tag] = field.text or ""
-        key = fields.get(namespace + "Key")
-        version = fields.get(namespace + "VersionId")
-        if key is None:
-            raise _malformed()
-        if version is not None:
-            if not re.fullmatch(r"[+-]?[0-9]+", version.strip()):
-                raise _malformed()
-            negative = version.strip().startswith("-")
-            version = version.strip().lstrip("+-").lstrip("0") or "0"
-            if negative and version != "0":
-                raise _malformed()
-            if len(version) > 19 or (
-                len(version) == 19 and version > "9223372036854775807"
-            ):
-                raise _malformed()
-        # The live XML endpoint trims surrounding XML whitespace from keys.
-        # Preserve all other text, including percent escapes and internal spaces.
-        entries.append((key.strip(" \t\r\n"), version))
-    if not entries:
-        raise _malformed()
-    if len(entries) > 1000:
-        raise XmlError(
-            "InvalidMultiObjectDeleteRequest", "At most 1000 objects can be deleted."
+    root = _parse_xml(data)
+    _validate_schema(root)
+    return _bind(root)
+
+
+# === DELETION === #
+
+
+def _require_bucket(database, bucket_name):
+    try:
+        database.get_bucket(bucket_name, None)
+    except RestException as ex:
+        if int(ex.code) == 404:
+            raise _no_such_bucket()
+        raise
+
+
+def _protection(bucket_name, key):
+    def check(blob, live_generation, context):
+        # Database preconditions run under its resource lock, so the object
+        # cannot change between this check and the deletion.
+        metadata = blob.metadata
+        if metadata.temporary_hold or metadata.event_based_hold:
+            kind = "Temporary" if metadata.temporary_hold else "Event-Based"
+            raise XmlError(
+                "ObjectUnderActiveHold",
+                "Object '%s/%s' is under active %s hold and cannot be deleted, "
+                "overwritten or archived until hold is removed."
+                % (bucket_name, key, kind),
+                403,
+            )
+        times = []
+        if metadata.HasField("retention_expire_time"):
+            times.append(metadata.retention_expire_time)
+        if metadata.retention.HasField("retain_until_time"):
+            times.append(metadata.retention.retain_until_time)
+        utc = datetime.timezone.utc
+        until = max((t.ToDatetime(tzinfo=utc) for t in times), default=None)
+        if until is not None and until > datetime.datetime.now(utc):
+            raise XmlError(
+                "RetentionPolicyNotMet",
+                "Object '%s/%s' is subject to bucket's retention policy or object "
+                "retention and cannot be deleted or overwritten until %s"
+                % (bucket_name, key, until.isoformat()),
+                403,
+            )
+        return True
+
+    return check
+
+
+def _resolve(database, bucket_name, key, generation):
+    """Return the generation an entry targets, or None if nothing exists."""
+    try:
+        if generation:
+            database.get_object(bucket_name, key, generation=generation)
+            return generation
+        return database.get_object(bucket_name, key).metadata.generation
+    except RestException as ex:
+        if int(ex.code) != 404:
+            raise
+    # Confirm this was a missing object rather than a removed bucket.
+    _require_bucket(database, bucket_name)
+    return None
+
+
+def _delete(database, bucket_name, key, generation, target):
+    """Delete one entry. Returns an XmlError, or None on success."""
+    if generation == 0:
+        # Explicit zero removes the live generation, even in versioned
+        # buckets. Use the resolved generation so a concurrent replacement is
+        # never deleted by this request.
+        if target is None:
+            return None
+        generation = target
+    try:
+        database.delete_object(
+            bucket_name,
+            key,
+            generation=generation or 0,
+            preconditions=[_protection(bucket_name, key)],
         )
-    if prefixed:
-        if namespace + "Key" in prefixed and namespace + "Object" not in prefixed:
-            raise XmlError("InvalidObjectName", "An object name is required.")
-        raise XmlError("InvalidArgument", "Prefixed XML elements are not supported.")
-    return entries, quiet
+    except RestException as ex:
+        if int(ex.code) != 404:
+            return XmlError.from_rest(ex)
+        # Missing objects are successful, but a removed bucket is not.
+        _require_bucket(database, bucket_name)
+    return None
 
 
 def delete_objects(database, request, bucket_name):
-    entries, quiet = _parse_request(request)
-    # A missing bucket is a request failure, even when every key is absent.
-    database.get_bucket(bucket_name, None)
+    parsed = _parse_request(request)
+    _require_bucket(database, bucket_name)
+    entries = [(key.strip(_KEY_WHITESPACE), gen) for key, gen in parsed.entries]
     if any(not key for key, _ in entries):
-        raise XmlError("InvalidObjectName", "An object name is required.")
-    result = ET.Element("DeleteResult", xmlns=NAMESPACE)
-    for key, version in dict.fromkeys(entries):
-        error = None
-        response_version = version
-        try:
-            generation = int(version) if version is not None else 0
-            if version == "0":
-                # Explicit zero selects the current generation for removal, even
-                # in a versioned bucket. Resolve it to an explicit generation so
-                # a concurrent replacement cannot be deleted by this request.
-                generation = database.get_object(bucket_name, key).metadata.generation
-            database.delete_object(
-                bucket_name,
-                key,
-                generation=generation,
-                preconditions=[_check_hold],
+        raise XmlError("InvalidObjectName", "You must specify an object name.")
+    # Identical targets (after normalization) are collapsed.
+    entries = list(dict.fromkeys(entries))
+    per_key = collections.Counter(key for key, _ in entries)
+    targets = [_resolve(database, bucket_name, k, g) for k, g in entries]
+    results = [
+        _delete(database, bucket_name, key, generation, target)
+        for (key, generation), target in zip(entries, targets)
+    ]
+    # When two entries resolve to the same existing object generation and both
+    # deletions succeed, GCS keeps the deletions but reports InternalError for
+    # every entry that targeted an existing object, including unrelated keys.
+    successes = collections.Counter(
+        (key, target)
+        for (key, _), target, error in zip(entries, targets, results)
+        if target is not None and error is None
+    )
+    conflict = any(count > 1 for count in successes.values())
+
+    deleted, errors = [], []
+    for (key, generation), target, error in zip(entries, targets, results):
+        if conflict and target is not None:
+            error = XmlError(
+                "InternalError",
+                "We encountered an internal error. Please try again.",
+                500,
             )
-            if version == "0":
-                response_version = str(generation)
-        except RestException as ex:
-            if int(ex.code) == 404:
-                # Confirm this was a missing object rather than a bucket removed
-                # concurrently with the request. Missing objects are successful.
-                database.get_bucket(bucket_name, None)
-            else:
-                error = XmlError.from_rest(ex)
-        if error is None and quiet:
-            continue
-        item = ET.SubElement(result, "Error" if error else "Deleted")
-        ET.SubElement(item, "Key").text = key
-        if response_version is not None:
-            ET.SubElement(item, "Generation").text = response_version
-            ET.SubElement(item, "VersionId").text = response_version
-        if error:
-            ET.SubElement(item, "Code").text = error.xml_code
-            ET.SubElement(item, "Message").text = error.msg
-    return _response(result)
-
-
-def _check_hold(blob, live_generation, context):
-    # Database preconditions run under its resource lock, so a held object cannot
-    # change between checking its metadata and deleting the selected generation.
-    if blob.metadata.temporary_hold or blob.metadata.event_based_hold:
-        raise XmlError(
-            "ObjectUnderActiveHold", "The object is under an active hold.", 403
-        )
-    return True
+        if error is not None or generation:
+            # Errors and explicit generations echo the requested generation.
+            reported = generation
+        elif generation == 0 or per_key[key] > 1:
+            # Explicit zero, or a key named by several entries, reports the
+            # resolved live generation (zero when there is none).
+            reported = target or 0
+        else:
+            reported = None
+        item = _element("Key", key)
+        if reported is not None:
+            item += _element("Generation", str(reported))
+            item += _element("VersionId", str(reported))
+        if error is not None:
+            item += _element("Code", error.xml_code) + _element("Message", error.msg)
+            errors.append((key, "<Error>%s</Error>" % item))
+        elif not parsed.quiet:
+            deleted.append((key, "<Deleted>%s</Deleted>" % item))
+    # GCS lists successes, then errors, each ordered by key.
+    items = sorted(deleted, key=lambda i: i[0]) + sorted(errors, key=lambda i: i[0])
+    body = "".join(item for _, item in items)
+    root = "DeleteResult xmlns='%s'" % NAMESPACE
+    return _response("<%s>%s</DeleteResult>" % (root, body) if body else "<%s/>" % root)
